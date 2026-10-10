@@ -14,6 +14,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    "zstandard>=0.22",  # tests/test_server.py exercises the mirror download
 ]
 # Extra deps needed only to run the MCP server over HTTP (Render/Docker).
 # Kept out of the base install so `pip install -e ".[dev]"` for local stdio

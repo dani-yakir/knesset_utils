@@ -156,3 +156,60 @@ def test_law_link_includes_enacting_bill(tmp_path):
     assert law["enacting_bill_id"] == 2198907
     assert amended_only["url"].endswith("/laws/7") and amended_only["enacting_bill_id"] is None
     assert missing["found_in_mirror"] is False
+
+
+def _mirror_cfg(tmp_path, monkeypatch):
+    monkeypatch.setenv("MCP_DB_PATH", str(tmp_path / "mirror.sqlite"))
+    monkeypatch.setenv("MIRROR_REPO", "owner/repo")
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    return ServerConfig.from_env()
+
+
+def _serve_asset(monkeypatch, body: bytes):
+    import contextlib
+
+    import httpx
+
+    @contextlib.contextmanager
+    def fake_stream(method, url, **kwargs):  # noqa: ARG001
+        yield httpx.Response(200, content=body, request=httpx.Request(method, url))
+
+    monkeypatch.setattr(httpx, "stream", fake_stream)
+
+
+_RELEASE = {"id": 1, "tag_name": "latest"}
+_ASSET = {"id": 2, "name": "knesset_mirror.sqlite.zst", "updated_at": "t",
+          "browser_download_url": "https://example.invalid/asset"}
+
+
+def test_mirror_swap_removes_leftovers_and_keeps_one_db(tmp_path, monkeypatch):
+    import zstandard
+
+    from knesset_utils.server import mirror
+
+    cfg = _mirror_cfg(tmp_path, monkeypatch)
+    cfg.db_path.write_bytes(b"old")
+    for name in ("tmpabc123.zst", "tmpdef456.sqlite.part", "mirror.sqlite.part"):
+        (tmp_path / name).write_bytes(b"orphan")
+    _serve_asset(monkeypatch, zstandard.ZstdCompressor().compress(b"new mirror"))
+
+    mirror._download_and_swap(cfg, _RELEASE, _ASSET)
+
+    assert cfg.db_path.read_bytes() == b"new mirror"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["mirror.sqlite", "mirror.sqlite.release"]
+
+
+def test_mirror_swap_keeps_old_db_on_truncated_asset(tmp_path, monkeypatch):
+    import zstandard
+
+    from knesset_utils.server import mirror
+
+    cfg = _mirror_cfg(tmp_path, monkeypatch)
+    cfg.db_path.write_bytes(b"old")
+    _serve_asset(monkeypatch, zstandard.ZstdCompressor().compress(b"new mirror" * 1000)[:-5])
+
+    with pytest.raises(RuntimeError):
+        mirror._download_and_swap(cfg, _RELEASE, _ASSET)
+
+    assert [p.name for p in tmp_path.iterdir()] == ["mirror.sqlite"]
+    assert cfg.db_path.read_bytes() == b"old"

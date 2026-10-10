@@ -10,16 +10,17 @@ Design points:
 - Freshness is tracked by a small marker file next to the DB (`<db>.release`)
   holding `<release id>:<asset id>:<asset updated_at>`. If it matches the live
   release, nothing is downloaded.
-- The new file is written to a temp path in the *same directory* and moved onto
+- The new file is written to `<db>.part` in the *same directory* and moved onto
   `db_path` with `os.replace()` (atomic on one filesystem). `server/tools.py`
   opens a fresh read-only connection per call, so a swap between calls is safe.
+- Only one DB is ever kept. Temp files orphaned by a killed download are swept
+  before the next one starts, so they cannot pile up on a persistent disk.
 - A transient failure never deletes or truncates a working local DB.
 """
 from __future__ import annotations
 
 import logging
 import os
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -66,20 +67,43 @@ def _marker(release: dict, asset: dict) -> str:
     return f"{release.get('id')}:{asset.get('id')}:{asset.get('updated_at')}"
 
 
-def _decompress(src: Path, dst: Path, window_log: int) -> None:
+def _part_path(db_path: Path) -> Path:
+    return db_path.with_name(db_path.name + ".part")
+
+
+def _sweep_leftovers(db_path: Path) -> None:
+    """Delete temp files left behind by a download that was killed mid-flight.
+
+    A SIGKILL (redeploy, OOM) skips the `finally` in `_download_and_swap`, and on
+    a persistent disk a DB-sized orphan then eats the headroom every later swap
+    needs. Only one download runs at a time, so anything matching is stale.
+    Also covers the randomly named `tmp*.zst` / `tmp*.sqlite.part` files that
+    earlier versions created.
+    """
+    part = _part_path(db_path)
+    for path in db_path.parent.iterdir():
+        legacy = path.name.startswith("tmp") and path.name.endswith((".zst", ".sqlite.part"))
+        if path == part or legacy:
+            try:
+                size = path.stat().st_size
+                path.unlink()
+                log.warning("removed leftover temp file %s (%d bytes)", path, size)
+            except OSError:
+                log.exception("could not remove leftover temp file %s", path)
+
+
+def _decompressor(window_log: int):
     import zstandard
 
     if window_log:
-        dctx = zstandard.ZstdDecompressor(max_window_size=1 << window_log)
-    else:
-        dctx = zstandard.ZstdDecompressor()
-    with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
-        dctx.copy_stream(fsrc, fdst, read_size=_CHUNK, write_size=_CHUNK)
+        return zstandard.ZstdDecompressor(max_window_size=1 << window_log)
+    return zstandard.ZstdDecompressor()
 
 
 def _download_and_swap(cfg: ServerConfig, release: dict, asset: dict) -> None:
     db_path = cfg.db_path
     db_path.parent.mkdir(parents=True, exist_ok=True)
+    _sweep_leftovers(db_path)
 
     if cfg.github_token:
         url = f"{_API}/repos/{cfg.mirror_repo}/releases/assets/{asset['id']}"
@@ -88,25 +112,25 @@ def _download_and_swap(cfg: ServerConfig, release: dict, asset: dict) -> None:
         url = asset["browser_download_url"]
         dl_headers = {}
 
-    fd_z, tmp_z = tempfile.mkstemp(dir=db_path.parent, suffix=".zst")
-    os.close(fd_z)
-    fd_d, tmp_d = tempfile.mkstemp(dir=db_path.parent, suffix=".sqlite.part")
-    os.close(fd_d)
+    # Decompress straight off the socket: the compressed asset never touches the
+    # disk, so the peak is the old DB plus the new one.
+    part = _part_path(db_path)
+    dobj = _decompressor(cfg.zstd_long_window_log).decompressobj()
     try:
         with httpx.stream("GET", url, headers=dl_headers, timeout=None, follow_redirects=True) as resp:
             resp.raise_for_status()
-            with open(tmp_z, "wb") as f:
+            with open(part, "wb") as f:
                 for chunk in resp.iter_bytes(_CHUNK):
-                    f.write(chunk)
-        _decompress(Path(tmp_z), Path(tmp_d), cfg.zstd_long_window_log)
-        os.replace(tmp_d, db_path)  # atomic on the same filesystem
+                    f.write(dobj.decompress(chunk))
+        if not dobj.eof:
+            raise RuntimeError(f"asset {asset.get('name')!r} ended before the zstd frame did")
+        os.replace(part, db_path)  # atomic on the same filesystem
         _marker_path(db_path).write_text(_marker(release, asset))
     finally:
-        for path in (tmp_z, tmp_d):
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+        try:
+            os.unlink(part)
+        except OSError:
+            pass
 
 
 def ensure_mirror(cfg: ServerConfig) -> None:
