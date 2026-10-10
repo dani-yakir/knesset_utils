@@ -22,7 +22,7 @@ services:
     disk:
       name: mirror-data
       mountPath: /data
-      sizeGB: 2              # ~730 MB DB + a transient .part during the atomic swap
+      sizeGB: 2              # ~800 MB DB + an equally large .part during the atomic swap
     envVars:
       - key: MCP_TRANSPORT
         value: streamable-http
